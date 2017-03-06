@@ -5,6 +5,8 @@ from enum import Enum
 from ctypes import *
 from ctypes import util
 
+import itertools
+
 from .types import *
 from .types import __LP64__, __i386__, __x86_64__, __arm__, __arm64__
 
@@ -867,6 +869,46 @@ class ObjCMethod(object):
                 result = ObjCClass(result)
             return result
 
+######################################################################
+
+class ObjCPartialMethod(object):
+    _sentinel = object()
+    
+    def __init__(self, name_start):
+        super().__init__()
+        
+        self.name_start = name_start
+    
+    def __repr__(self):
+        return "{cls.__module__}.{cls.__qualname__}({self.name_start!r})".format(cls=type(self), self=self)
+    
+    def __call__(self, receiver, first_arg=_sentinel, **kwargs):
+        if first_arg is ObjCPartialMethod._sentinel:
+            if kwargs:
+                raise TypeError("Missing first (positional) argument")
+            else:
+                meth = objc.class_getInstanceMethod(receiver.objc_class, SEL(self.name_start))
+                
+                if meth is None:
+                    raise ValueError("No method named {}".format(self.name_start))
+                else:
+                    return meth()
+        else:
+            parts = (self.name_start,) + tuple(kwargs)
+            try:
+                meth = receiver.partial_method_cache[frozenset(parts)]
+            except KeyError:
+                meth = objc.class_getInstanceMethod(receiver.objc_class, SEL(":".join(parts) + ":"))
+                
+                if meth is None:
+                    for rest in itertools.permutations(kwargs):
+                        parts = (self.name_start,) + rest
+                        meth = objc.class_getInstanceMethod(receiver.objc_class, SEL(":".join(parts) + ":"))
+                        if meth is not None:
+                            break
+
+                if meth is None:
+                    raise ValueError("No method found for name parts {}".format(parts))
 
 ######################################################################
 
@@ -1223,6 +1265,8 @@ class ObjCInstance(object):
         method = cache_method(self.objc_class, name)
         if method:
             return ObjCBoundMethod(method, self)
+        elif "_" not in name:
+            return ObjCBoundMethod(ObjCPartialMethod(self.objc_class), self)
         else:
             raise AttributeError('%s.%s %s has no attribute %s' % (type(self).__module__, type(self).__qualname__, self.objc_class.name, name))
 
@@ -1316,9 +1360,10 @@ class ObjCClass(ObjCInstance, type):
         # If there is no cached instance for ptr, a new one is created and cached.
         self = super().__new__(cls, ptr, objc_class_name, (ObjCInstance,), {
             'name': objc_class_name,
-            'instance_methods': {},     # mapping of name -> instance method
-            'instance_properties': {},  # mapping of name -> (accessor method, mutator method)
+            'instance_methods': {},     # Mapping of name -> instance method
+            'instance_properties': {},  # Mapping of name -> (accessor method, mutator method)
             'imp_table': {},            # Mapping of name -> Native method references
+            'partial_method_cache': {}, # Mapping of frozenset (of selector parts) -> instance method
         })
 
         # Register all the methods, class methods, etc
