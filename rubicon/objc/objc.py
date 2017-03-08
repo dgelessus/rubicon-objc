@@ -24,6 +24,7 @@ def _find_or_error(name):
     else:
         return path
 
+c = cdll.LoadLibrary(_find_or_error('c'))
 objc = cdll.LoadLibrary(_find_or_error('objc'))
 Foundation = cdll.LoadLibrary(_find_or_error('Foundation'))
 
@@ -35,7 +36,7 @@ class SEL(c_void_p):
     def name(self):
         return objc.sel_getName(self)
     
-    def __new__(cls, init=None):
+    def __new__(cls, init):
         if isinstance(init, (bytes, str)):
             self = objc.sel_registerName(ensure_bytes(init))
             self._inited = True
@@ -48,6 +49,9 @@ class SEL(c_void_p):
     def __init__(self, init=None):
         if not self._inited:
             super().__init__(init)
+            
+            if self.value is None:
+                raise ValueError("Cannot create selector from null pointer")
     
     def __repr__(self):
         return "{cls.__module__}.{cls.__qualname__}({self.name!r})".format(cls=type(self), self=self)
@@ -68,6 +72,9 @@ class objc_property_t(c_void_p):
     pass
 
 ######################################################################
+
+c.free.restype = None
+c.free.argtypes = [c_void_p]
 
 # BOOL class_addIvar(Class cls, const char *name, size_t size, uint8_t alignment, const char *types)
 objc.class_addIvar.restype = c_bool
@@ -506,8 +513,10 @@ def send_message(receiver, selName, *args, **kwargs):
     be a ctypes type and argtypes should be a list of ctypes types for
     the arguments of the message only.
     """
-    if type(receiver) in (ObjCClass, ObjCInstance):
+    try:
         receiver = receiver._as_parameter_
+    except AttributeError:
+        pass
 
     if isinstance(receiver, (str, bytes)):
         receiver = cast(get_class(receiver), objc_id)
@@ -746,12 +755,11 @@ class ObjCMethod(object):
         b'd': c_double,
         b'B': c_bool,
         b'v': None,
-        b'Vv': None,
         b'*': c_char_p,
         b'@': objc_id,
+        b'@?': objc_id,
         b'#': Class,
         b':': SEL,
-        b'^v': c_void_p,
         b'?': c_void_p,
         NSPointEncoding: NSPoint,
         NSSizeEncoding: NSSize,
@@ -783,41 +791,43 @@ class ObjCMethod(object):
         # Get types for all the arguments.
         try:
             self.argtypes = [self.ctype_for_encoding(t) for t in self.argument_types]
-        except:
+        except ValueError:
             print('No argtypes encoding for %s (%s)' % (self.name, self.argument_types))
             self.argtypes = None
         # Get types for the return type.
         try:
             self.restype = self.ctype_for_encoding(self.return_type)
-        except:
+        except ValueError:
             print('No restype encoding for %s (%s)' % (self.name, self.return_type))
             self.restype = None
         self.func = None
 
-    def ctype_for_encoding(self, encoding):
+    @classmethod
+    def ctype_for_encoding(cls, encoding):
         """Return ctypes type for an encoded Objective-C type."""
-        if encoding in self.typecodes:
-            return self.typecodes[encoding]
-        elif encoding[0:1] == b'^' and encoding[1:] in self.typecodes:
-            return POINTER(self.typecodes[encoding[1:]])
-        elif encoding[0:1] == b'^' and encoding[1:] in [CGImageEncoding, NSZoneEncoding]:
-            # special cases
-            return c_void_p
-        elif encoding[0:1] == b'r' and encoding[1:] in self.typecodes:
-            # const decorator, don't care
-            return self.typecodes[encoding[1:]]
-        elif encoding[0:2] == b'r^' and encoding[2:] in self.typecodes:
-            # const pointer, also don't care
-            return POINTER(self.typecodes[encoding[2:]])
+        # Remove qualifiers
+        encoding = encoding.lstrip(b"NORVnor")
+        
+        if encoding in cls.typecodes:
+            return cls.typecodes[encoding]
+        elif encoding[0:1] == b'^':
+            try:
+                # Try to get a ctype for the target encoding
+                target = cls.ctype_for_encoding(encoding[1:])
+            except ValueError:
+                # For unknown target types, fall back to c_void_p
+                return c_void_p
+            else:
+                return POINTER(target)
         else:
-            raise Exception('unknown encoding for %s: %s' % (self.name, encoding))
+            raise ValueError('Unknown encoding: %s' % (encoding,))
 
     def get_prototype(self):
         """Returns a ctypes CFUNCTYPE for the method."""
         return CFUNCTYPE(self.restype, *self.argtypes)
 
     def __repr__(self):
-        return "<ObjCMethod: %s %s>" % (self.name, self.encoding)
+        return "<{cls.__module__}.{cls.__qualname__} {self.name} {self.encoding}>".format(cls=type(self), self=self)
 
     def get_callable(self):
         """Returns a python-callable version of the method's IMP."""
@@ -867,6 +877,40 @@ class ObjCMethod(object):
                 result = ObjCClass(result)
             return result
 
+######################################################################
+
+class ObjCPartialMethod(object):
+    _sentinel = object()
+    
+    def __init__(self, name_start):
+        super().__init__()
+        
+        self.name_start = name_start
+        self.methods = {}
+    
+    def __repr__(self):
+        return "{cls.__module__}.{cls.__qualname__}({self.name_start!r})".format(cls=type(self), self=self)
+    
+    def __call__(self, receiver, first_arg=_sentinel, **kwargs):
+        if first_arg is ObjCPartialMethod._sentinel:
+            if kwargs:
+                raise TypeError("Missing first (positional) argument")
+            
+            args = []
+            rest = frozenset()
+        else:
+            args = [first_arg]
+            # Add "" to rest to indicate that the method takes arguments
+            rest = frozenset(kwargs) | frozenset(("",))
+        
+        try:
+            meth, order = self.methods[rest]
+        except KeyError:
+            raise ValueError("No method with selector parts {}".format(set(kwargs)))
+        
+        meth = ObjCMethod(meth)
+        args += [kwargs[name] for name in order]
+        return meth(receiver, *args)
 
 ######################################################################
 
@@ -883,7 +927,7 @@ class ObjCBoundMethod(object):
             self.receiver = receiver
 
     def __repr__(self):
-        return '<ObjCBoundMethod %s (%s)>' % (self.method.name, self.receiver)
+        return "{cls.__module__}.{cls.__qualname__}({self.method!r}, {self.receiver!r})".format(cls=type(self), self=self)
 
     def __call__(self, *args, **kwargs):
         """Call the method with the given arguments."""
@@ -1220,11 +1264,33 @@ class ObjCInstance(object):
             if method:
                 return ObjCBoundMethod(method, self)()
 
+        # See if there's a partial method starting with the given name,
+        # either on self's class or any of the superclasses.
+        cls = self.objc_class
+        while cls is not None:
+            try:
+                method = cls.partial_methods[name]
+                break
+            except KeyError:
+                cls = cls.superclass
+        else:
+            method = None
+        
+        if method is not None:
+            # If the partial method can only resolve to one method that takes no arguments,
+            # return that method directly, instead of a mostly useless partial method.
+            if set(method.methods) == {frozenset()}:
+                method, _ = method.methods[frozenset()]
+                method = ObjCMethod(method)
+            
+            return ObjCBoundMethod(method, self)
+
+        # See if there's a method whose full name matches the given name.
         method = cache_method(self.objc_class, name)
         if method:
             return ObjCBoundMethod(method, self)
-        else:
-            raise AttributeError('%s.%s %s has no attribute %s' % (type(self).__module__, type(self).__qualname__, self.objc_class.name, name))
+        
+        raise AttributeError('%s.%s %s has no attribute %s' % (type(self).__module__, type(self).__qualname__, self.objc_class.name, name))
 
     def __setattr__(self, name, value):
         # Convert enums to their underlying values.
@@ -1247,6 +1313,14 @@ class ObjCInstance(object):
 # would be no opportunity to pass extra arguments.
 class ObjCClass(ObjCInstance, type):
     """Python wrapper for an Objective-C class."""
+
+    @property
+    def superclass(self):
+        super_ptr = objc.class_getSuperclass(self)
+        if cast(super_ptr, c_void_p).value is None:
+            return None
+        else:
+            return ObjCClass(super_ptr)
 
     def __new__(cls, *args):
         """Create a new ObjCClass instance or return a previously created
@@ -1319,6 +1393,7 @@ class ObjCClass(ObjCInstance, type):
             'instance_methods': {},     # mapping of name -> instance method
             'instance_properties': {},  # mapping of name -> (accessor method, mutator method)
             'imp_table': {},            # Mapping of name -> Native method references
+            'partial_methods': {},      # Mapping of first selector part -> ObjCPartialMethod instances
         })
 
         # Register all the methods, class methods, etc
@@ -1328,6 +1403,32 @@ class ObjCClass(ObjCInstance, type):
 
             if hasattr(obj, "register_property"):
                 obj.register_property(attr, self)
+        
+        if not self.partial_methods:
+            # Cache all partial methods
+            out_count = c_uint()
+            methods_ptr = objc.class_copyMethodList(self, byref(out_count))
+            if methods_ptr is None:
+                raise RuntimeError("Failed to get method list for class {}".format(objc_class_name))
+            
+            try:
+                for i in range(out_count.value):
+                    # meth stays a raw Method object (pointer) in the cache, it is converted to an ObjCMethod only when called.
+                    # This is to eliminate warnings about unknown type encodings from methods that are never used.
+                    meth = methods_ptr[i]
+                    # Note: rest[-1] == "" iff the method takes arguments, otherwise rest is empty
+                    first, *rest = objc.method_getName(meth).name.decode("utf-8").split(":")
+                    
+                    try:
+                        partial = self.partial_methods[first]
+                    except KeyError:
+                        partial = self.partial_methods[first] = ObjCPartialMethod(first)
+                    
+                    # order is rest without the dummy "" part
+                    order = rest[:-1]
+                    partial.methods[frozenset(rest)] = (meth, order)
+            finally:
+                c.free(methods_ptr)
 
         return self
 

@@ -15,7 +15,7 @@ except:
 import faulthandler
 faulthandler.enable()
 
-from rubicon.objc import ObjCInstance, ObjCClass, ObjCMetaClass, NSObject, objc, objc_method, objc_classmethod, objc_property, NSEdgeInsets, NSEdgeInsetsMake, send_message
+from rubicon.objc import ObjCInstance, ObjCClass, ObjCMetaClass, NSObject, objc, objc_method, objc_classmethod, objc_property, NSUInteger, NSRange, NSEdgeInsets, NSEdgeInsetsMake, send_message
 from rubicon.objc import core_foundation
 
 
@@ -487,6 +487,36 @@ class RubiconTest(unittest.TestCase):
         res = example.toString(convert_result=False)
         self.assertNotIsInstance(res, ObjCInstance)
         self.assertEqual(str(ObjCInstance(res)), "This is an ObjC Example object")
+    
+    def test_partial_method_no_args(self):
+        Example = ObjCClass("Example")
+        self.assertEqual(Example.overloaded(), 0)
+    
+    def test_partial_method_one_arg(self):
+        Example = ObjCClass("Example")
+        self.assertEqual(Example.overloaded(42), 42)
+    
+    def test_partial_method_two_args(self):
+        Example = ObjCClass("Example")
+        self.assertEqual(Example.overloaded(12, extraArg=34), 12+34)
+
+    def test_partial_method_lots_of_args(self):
+        pystring = "Uñîçö∂€"
+        pybytestring = pystring.encode("utf-8")
+        nsstring = core_foundation.at(pystring)
+        buf = create_string_buffer(len(pybytestring) + 1)
+        usedLength = NSUInteger()
+        remaining = NSRange(0, 0)
+        nsstring.getBytes(
+            buf,
+            maxLength=32,
+            usedLength=byref(usedLength),
+            encoding=4, # NSUTF8StringEncoding
+            options=0,
+            range=NSRange(0, 7),
+            remainingRange=byref(remaining),
+        )
+        self.assertEqual(buf.value.decode("utf-8"), pystring)
 
     def test_duplicate_class_registration(self):
         "If you define a class name twice in the same runtime, you get an error."
