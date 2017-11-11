@@ -11,7 +11,7 @@ from enum import Enum
 
 from rubicon.objc import (
     SEL, NSEdgeInsets, NSEdgeInsetsMake, NSObject, NSObjectProtocol, NSRange, NSUInteger,
-    ObjCClass, ObjCInstance, ObjCMetaClass, ObjCProtocol, core_foundation, objc_classmethod,
+    ObjCClass, ObjCInstance, ObjCMetaClass, ObjCProtocol, at, objc_classmethod,
     objc_const, objc_method, objc_property, send_message, types,
 )
 from rubicon.objc.runtime import ObjCBoundMethod, libobjc
@@ -661,7 +661,7 @@ class RubiconTest(unittest.TestCase):
     def test_partial_method_lots_of_args(self):
         pystring = "Uñîçö∂€"
         pybytestring = pystring.encode("utf-8")
-        nsstring = core_foundation.at(pystring)
+        nsstring = at(pystring)
         buf = create_string_buffer(len(pybytestring) + 1)
         usedLength = NSUInteger()
         remaining = NSRange(0, 0)
@@ -900,7 +900,7 @@ class RubiconTest(unittest.TestCase):
     def test_cfstring_to_str(self):
         "CFString/NSString instances can be converted to Python str."
 
-        self.assertEqual(str(core_foundation.at("abcdef")), "abcdef")
+        self.assertEqual(str(at("abcdef")), "abcdef")
 
     def test_objc_const(self):
         "objc_const works."
